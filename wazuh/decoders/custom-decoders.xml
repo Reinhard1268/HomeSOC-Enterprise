@@ -1,0 +1,220 @@
+<!-- =============================================================================
+     custom-decoders.xml — Custom Wazuh Log Decoders
+     Author: SOC Lab Project
+     Description: Decoders for Sysmon events, Windows Security logs,
+                  Linux auth logs, and Docker container logs.
+                  Decoders parse raw log strings into named fields that
+                  rules can then match against.
+     Deploy to: /var/ossec/etc/decoders/custom/
+     ============================================================================= -->
+
+<!-- ══════════════════════════════════════════════════════════════════════════════
+     DECODER GROUP 1: Sysmon (Windows)
+     Sysmon logs arrive via Windows Event Log as eventchannel messages.
+     The wazuh-logcollector already parses the XML structure, but these
+     decoders help extract custom fields from the EventData section.
+     ══════════════════════════════════════════════════════════════════════════════ -->
+
+<!-- Parent decoder: identifies Sysmon events by provider name -->
+<decoder name="sysmon-eventchannel">
+  <parent>windows-eventchannel</parent>
+  <prematch>Microsoft-Windows-Sysmon</prematch>
+  <order>log</order>
+  <ftscomment>Sysmon event identified by provider name</ftscomment>
+</decoder>
+
+<!-- Sysmon EID 1: Process Create — extract process name, command line, parent -->
+<decoder name="sysmon-process-create">
+  <parent>sysmon-eventchannel</parent>
+  <prematch>EventID: 1</prematch>
+  <regex offset="after_prematch">Image: (\S+).*CommandLine: (.*?)ParentImage: (\S+).*User: (\S+)</regex>
+  <order>win.eventdata.image, win.eventdata.commandLine, win.eventdata.parentImage, win.eventdata.user</order>
+</decoder>
+
+<!-- Sysmon EID 3: Network Connection — extract source, destination, process -->
+<decoder name="sysmon-network-connect">
+  <parent>sysmon-eventchannel</parent>
+  <prematch>EventID: 3</prematch>
+  <regex offset="after_prematch">Image: (\S+).*SourceIp: (\S+).*SourcePort: (\d+).*DestinationIp: (\S+).*DestinationPort: (\d+).*Protocol: (\S+)</regex>
+  <order>win.eventdata.image, win.eventdata.sourceIp, win.eventdata.sourcePort, win.eventdata.destinationIp, win.eventdata.destinationPort, win.eventdata.protocol</order>
+</decoder>
+
+<!-- Sysmon EID 10: Process Access — extract source and target process -->
+<decoder name="sysmon-process-access">
+  <parent>sysmon-eventchannel</parent>
+  <prematch>EventID: 10</prematch>
+  <regex offset="after_prematch">SourceImage: (\S+).*TargetImage: (\S+).*GrantedAccess: (\S+).*CallTrace: (.*?)\s*$</regex>
+  <order>win.eventdata.sourceImage, win.eventdata.targetImage, win.eventdata.grantedAccess, win.eventdata.callTrace</order>
+</decoder>
+
+<!-- Sysmon EID 11: FileCreate — extract filename and creating process -->
+<decoder name="sysmon-file-create">
+  <parent>sysmon-eventchannel</parent>
+  <prematch>EventID: 11</prematch>
+  <regex offset="after_prematch">Image: (\S+).*TargetFilename: (.*?)\s*Creation</regex>
+  <order>win.eventdata.image, win.eventdata.targetFilename</order>
+</decoder>
+
+<!-- Sysmon EID 12/13: Registry — extract key path and value -->
+<decoder name="sysmon-registry">
+  <parent>sysmon-eventchannel</parent>
+  <prematch>EventID: 1[23]</prematch>
+  <regex offset="after_prematch">EventType: (\S+).*Image: (\S+).*TargetObject: (.*?)\s*(Details:|$)</regex>
+  <order>win.eventdata.eventType, win.eventdata.image, win.eventdata.targetObject</order>
+</decoder>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════════════
+     DECODER GROUP 2: Windows Security Event Log
+     Parses key Windows Security events for authentication, process tracking,
+     and privilege use. These come in as eventchannel logs.
+     ══════════════════════════════════════════════════════════════════════════════ -->
+
+<!-- Parent decoder for Windows Security channel -->
+<decoder name="windows-security-eventchannel">
+  <parent>windows-eventchannel</parent>
+  <prematch>Microsoft-Windows-Security-Auditing</prematch>
+</decoder>
+
+<!-- EID 4624/4625: Logon events — extract account, logon type, source IP -->
+<decoder name="windows-logon">
+  <parent>windows-security-eventchannel</parent>
+  <prematch>EventID: 462[45]</prematch>
+  <regex offset="after_prematch">Account Name:\s+(\S+).*Account Domain:\s+(\S+).*Logon Type:\s+(\d+).*Source Network Address:\s+(\S+).*Source Port:\s+(\d+)</regex>
+  <order>win.eventdata.targetUserName, win.eventdata.targetDomainName, win.eventdata.logonType, srcip, srcport</order>
+</decoder>
+
+<!-- EID 4688: Process Creation (Security log version) -->
+<decoder name="windows-process-create-security">
+  <parent>windows-security-eventchannel</parent>
+  <prematch>EventID: 4688</prematch>
+  <regex offset="after_prematch">New Process Name:\s+(\S+).*Creator Process Name:\s+(\S+).*Process Command Line:\s+(.*?)\s*Token Elevation</regex>
+  <order>win.eventdata.newProcessName, win.eventdata.parentProcessName, win.eventdata.commandLine</order>
+</decoder>
+
+<!-- EID 4698/4699: Scheduled task created/deleted -->
+<decoder name="windows-scheduled-task">
+  <parent>windows-security-eventchannel</parent>
+  <prematch>EventID: 469[89]</prematch>
+  <regex offset="after_prematch">Task Name:\s+(\S+).*Subject:\s+Security ID:\s+(\S+).*Account Name:\s+(\S+)</regex>
+  <order>win.eventdata.taskName, win.eventdata.subjectUserSid, win.eventdata.subjectUserName</order>
+</decoder>
+
+<!-- EID 4720: User account created -->
+<decoder name="windows-account-create">
+  <parent>windows-security-eventchannel</parent>
+  <prematch>EventID: 4720</prematch>
+  <regex offset="after_prematch">New Account:\s+.*?Account Name:\s+(\S+).*Account Domain:\s+(\S+).*Subject:.*Account Name:\s+(\S+)</regex>
+  <order>win.eventdata.targetUserName, win.eventdata.targetDomainName, win.eventdata.subjectUserName</order>
+</decoder>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════════════
+     DECODER GROUP 3: Linux Auth Log (/var/log/auth.log)
+     Parses SSH, sudo, su, PAM, and cron auth messages from syslog-format logs.
+     ══════════════════════════════════════════════════════════════════════════════ -->
+
+<!-- Parent: identify auth.log by program field -->
+<decoder name="linux-auth-parent">
+  <prematch>^\w+ \d+ \d+:\d+:\d+ \S+ (sshd|sudo|su|useradd|userdel|passwd|PAM|cron)</prematch>
+</decoder>
+
+<!-- SSH failed password -->
+<decoder name="linux-ssh-failed">
+  <parent>linux-auth-parent</parent>
+  <prematch>Failed password for</prematch>
+  <regex offset="after_prematch">Failed password for (?:invalid user )?(\S+) from (\S+) port (\d+)</regex>
+  <order>user, srcip, srcport</order>
+</decoder>
+
+<!-- SSH accepted password / publickey -->
+<decoder name="linux-ssh-success">
+  <parent>linux-auth-parent</parent>
+  <prematch>Accepted (password|publickey) for</prematch>
+  <regex offset="after_prematch">Accepted (\S+) for (\S+) from (\S+) port (\d+)</regex>
+  <order>win.eventdata.authMethod, user, srcip, srcport</order>
+</decoder>
+
+<!-- SSH invalid user attempt -->
+<decoder name="linux-ssh-invalid-user">
+  <parent>linux-auth-parent</parent>
+  <prematch>Invalid user</prematch>
+  <regex offset="after_prematch">Invalid user (\S+) from (\S+) port (\d+)</regex>
+  <order>user, srcip, srcport</order>
+</decoder>
+
+<!-- sudo: command execution -->
+<decoder name="linux-sudo">
+  <parent>linux-auth-parent</parent>
+  <prematch>sudo:</prematch>
+  <regex offset="after_prematch">(\S+) : TTY=(\S+) ; PWD=(\S+) ; USER=(\S+) ; COMMAND=(.*)</regex>
+  <order>user, extra_data, url, dstuser, command</order>
+</decoder>
+
+<!-- su: switch user -->
+<decoder name="linux-su">
+  <parent>linux-auth-parent</parent>
+  <prematch>su[: ]</prematch>
+  <regex offset="after_prematch">(?:Successful su|FAILED su) for (\S+) by (\S+)</regex>
+  <order>dstuser, user</order>
+</decoder>
+
+<!-- useradd / userdel -->
+<decoder name="linux-user-mgmt">
+  <parent>linux-auth-parent</parent>
+  <prematch>useradd|userdel|usermod</prematch>
+  <regex offset="after_prematch">(?:new user|delete user|modified user): name=(\S+),.*by (\S+)</regex>
+  <order>extra_data, user</order>
+</decoder>
+
+
+<!-- ══════════════════════════════════════════════════════════════════════════════
+     DECODER GROUP 4: Docker Container Logs
+     Docker logs arrive via the Wazuh agent's localfile block monitoring
+     /var/lib/docker/containers/*/*.log. Format is JSON with container metadata.
+     ══════════════════════════════════════════════════════════════════════════════ -->
+
+<!-- Parent: identify Docker JSON log format -->
+<decoder name="docker-log-parent">
+  <prematch>^\{"log":"</prematch>
+</decoder>
+
+<!-- Docker: extract log, stream, and time from JSON -->
+<decoder name="docker-log-json">
+  <parent>docker-log-parent</parent>
+  <use_own_name>true</use_own_name>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+  <order>log, extra_data, id</order>
+  <!-- JSON fields: log, stream, time -->
+</decoder>
+
+<!-- Docker: failed authentication inside container -->
+<decoder name="docker-auth-failure">
+  <parent>docker-log-json</parent>
+  <prematch>authentication failure|Failed password|Access denied</prematch>
+  <regex>(?:authentication failure|Failed password|Access denied).*?user=(\S+).*?host=(\S+)</regex>
+  <order>user, srcip</order>
+</decoder>
+
+<!-- Docker: container privilege escalation attempt -->
+<decoder name="docker-privilege-escalation">
+  <parent>docker-log-json</parent>
+  <prematch>sudo|su -|runuser</prematch>
+  <regex>(\S+)\s*:\s*command not allowed\s*;\s*TTY=(\S+).*COMMAND=(.*)</regex>
+  <order>user, extra_data, command</order>
+</decoder>
+
+<!-- Docker daemon events (from /var/log/docker.log or journald) -->
+<decoder name="docker-daemon">
+  <prematch>time=".*" level=</prematch>
+  <regex>time="(\S+)" level=(\S+) msg="(.*?)"</regex>
+  <order>id, status, data</order>
+</decoder>
+
+<!-- Docker: container start/stop events -->
+<decoder name="docker-container-event">
+  <parent>docker-daemon</parent>
+  <prematch>Handler for (POST|DELETE)</prematch>
+  <regex>Handler for (POST|DELETE) .*/containers/(\S+)/</regex>
+  <order>action, extra_data</order>
+</decoder>

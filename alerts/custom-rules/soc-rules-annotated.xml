@@ -1,0 +1,693 @@
+<!-- =============================================================================
+     soc-rules-annotated.xml — Custom Wazuh Rules with Full Inline Annotations
+     Author: SOC Lab Project
+     Purpose: This is the REFERENCE copy of all 10 custom detection rules.
+              Every field is explained so junior analysts understand exactly
+              what each rule does, why the thresholds were chosen, and how
+              to tune it for their environment.
+     NOTE: The deployable copy lives in wazuh/rules/custom-soc-rules.xml
+           This file is for learning and documentation purposes.
+     ============================================================================= -->
+
+<group name="soc-lab,custom-detections">
+
+<!--
+  ╔══════════════════════════════════════════════════════════════════════════════╗
+  ║  HOW WAZUH RULES WORK — QUICK REFERENCE                                     ║
+  ║                                                                              ║
+  ║  <rule id="X" level="Y">                                                     ║
+  ║    id     : Unique integer. Custom rules must use 100000–199999.             ║
+  ║    level  : 0–15 alert severity.                                             ║
+  ║              0–2  = system/debug   (not usually alerted)                    ║
+  ║              3–5  = low            (informational)                           ║
+  ║              6–9  = medium         (worth reviewing)                         ║
+  ║              10–12 = high          (investigate promptly)                    ║
+  ║              13–14 = critical      (immediate response)                      ║
+  ║              15   = maximum        (fire everything, wake people up)         ║
+  ║                                                                              ║
+  ║  <if_matched_sid>  : Fires when another rule has ALREADY fired N times      ║
+  ║  <if_sid>          : Fires when another rule fires in the same event         ║
+  ║  <if_group>        : Fires when event belongs to a group                     ║
+  ║  <field name="X">  : Matches a decoded field value (supports regex)          ║
+  ║  <same_source_ip>  : Counts only events from the SAME source IP              ║
+  ║  <frequency>       : How many times rule must match within <timeframe>       ║
+  ║  <timeframe>       : Sliding window in seconds for frequency counting        ║
+  ║  <mitre>           : ATT&CK technique IDs for dashboard/reporting            ║
+  ║  <group>           : Logical tags — used for filtering and dashboard views   ║
+  ╚══════════════════════════════════════════════════════════════════════════════╝
+-->
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100001 — SSH Brute Force Detection
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         Counts the number of times Wazuh built-in rule 5760 fires from the
+         same source IP within a sliding 60-second window. Rule 5760 is the
+         standard "sshd: authentication failed" rule that ships with Wazuh.
+         When the count reaches 10, this rule fires at level 12 (High).
+
+       WHY THESE THRESHOLDS:
+         - frequency="10": 10 failures in 60s is aggressive enough to be an
+           automated attack. Legitimate users who mistype their password rarely
+           exceed 3 attempts. Setting this too low (e.g. 3) causes many false
+           positives from users with password managers that auto-retry.
+         - timeframe="60": A 60-second window is tight enough to catch real-time
+           brute force tools (Hydra, Medusa) while ignoring slow distributed
+           attacks that pace themselves at 1 attempt per minute.
+
+       TUNING GUIDE:
+         Increase frequency to 20 if you see many false positives from:
+           - CI/CD systems doing frequent SSH-based deployments
+           - Monitoring tools that test SSH connectivity
+           - Users with many SSH keys causing auth failures before the right one
+         Decrease timeframe to 30 if you want to catch faster tooling.
+         Increase timeframe to 120 to catch slower distributed attacks.
+
+       FALSE POSITIVE SOURCES:
+         - Port scanners that probe SSH with no intent to auth
+         - Misconfigured automation using wrong credentials
+         - Shodan/Censys internet scanning (check IP reputation first)
+
+       RESPONSE: Open TheHive case using brute-force-case-template.json
+                 Block IP with UFW/iptables if not RFC1918
+                 Escalate if rule 100002 fires within 120s
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100001" level="12" frequency="10" timeframe="60">
+
+    <!-- Parent rule: triggers when built-in SSH failure rule fires 10x -->
+    <if_matched_sid>5760</if_matched_sid>
+
+    <!-- Count per source IP — don't mix attackers together -->
+    <same_source_ip />
+
+    <!-- Human-readable description — appears in Wazuh/Kibana dashboards -->
+    <!-- $(srcip) is a dynamic substitution of the decoded source IP field -->
+    <description>SSH brute force attack: 10+ failed logins from $(srcip) in 60 seconds</description>
+
+    <!-- MITRE ATT&CK mapping for the Wazuh MITRE dashboard -->
+    <mitre>
+      <id>T1110.001</id>   <!-- Brute Force: Password Guessing -->
+    </mitre>
+
+    <!-- Groups used for filtering in dashboards and integration routing -->
+    <!-- pci_dss_10.2.4 = Account lockout failures -->
+    <!-- pci_dss_10.2.5 = Use of authentication mechanisms -->
+    <!-- gpg13_7.1 = User activity is logged -->
+    <group>authentication_failures,brute_force,pci_dss_10.2.4,pci_dss_10.2.5,gpg13_7.1</group>
+
+  </rule>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100002 — Successful Login After Brute Force (Critical Escalation)
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         This is a CORRELATION rule. It looks for a successful SSH login
+         (built-in rule 5715) occurring from the SAME source IP that
+         already triggered rule 100001 (brute force) within 120 seconds.
+         This is the "brute force succeeded" detector — it fires at level
+         15 (maximum) because this is a confirmed or near-confirmed compromise.
+
+       WHY THIS APPROACH:
+         Many SOCs only alert on failures. This rule correlates FAILURE+SUCCESS
+         from the same IP to detect the moment a brute force actually works.
+         Level 15 ensures this fires PagerDuty/on-call escalation immediately.
+
+       IMPORTANT NOTES:
+         - <if_matched_sid> points to 100001 (our custom rule), not 5760
+         - <if_sid>5715 means "AND also the current event is a successful login"
+         - <same_source_ip> ensures it's the SAME attacker who bruted, not a
+           coincidental legit login from a different IP
+
+       TUNING GUIDE:
+         timeframe="120": 2 minutes between brute force and success detection.
+         Increase to 300 if attackers are pacing their attacks slowly.
+         This rule has very low false positive rates — almost any fire is real.
+
+       RESPONSE: IMMEDIATE — do not wait for analyst review
+                 Lock account: sudo passwd -l <user>
+                 Kill sessions: sudo pkill -u <user>
+                 Escalate to Critical in TheHive
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100002" level="15" timeframe="120">
+
+    <!-- Correlation: must have seen brute force from same IP recently -->
+    <if_matched_sid>100001</if_matched_sid>
+    <same_source_ip />
+
+    <!-- The current event must ALSO be a successful login (rule 5715) -->
+    <if_sid>5715</if_sid>   <!-- sshd: authentication success -->
+
+    <description>CRITICAL: Successful SSH login from $(srcip) after brute force — possible compromise</description>
+
+    <mitre>
+      <id>T1110.001</id>   <!-- Brute Force: Password Guessing (success) -->
+      <id>T1078</id>        <!-- Valid Accounts (attacker now has valid creds) -->
+    </mitre>
+
+    <group>authentication_success,brute_force,pci_dss_10.2.4,pci_dss_10.2.5</group>
+
+  </rule>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100003 — LSASS Memory Access (Credential Dumping)
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         Matches Sysmon Event ID 10 (ProcessAccess) where the TARGET of the
+         memory access operation is lsass.exe. The Windows Local Security
+         Authority Subsystem Service stores credentials in memory including
+         NTLM hashes and Kerberos tickets — it is the #1 target for
+         credential dumpers: Mimikatz, ProcDump, SharpDump, Credential
+         Guard bypass tools.
+
+       FIELD BREAKDOWN:
+         win.system.eventID = "10"   : Sysmon EID 10 = ProcessAccess event
+         win.eventdata.targetImage   : The process being READ from (lsass.exe)
+         type="pcre2"                : Use Perl-Compatible Regular Expressions
+         (?i)                        : Case-insensitive match
+         lsass\.exe$                 : Matches the filename, anchored to end
+                                       (prevents "notlsass.exe" from matching)
+
+       WHY NOT CHECK sourceImage (the attacker process)?
+         Attackers rename their tools constantly. Matching the TARGET (lsass.exe)
+         is more reliable than matching the source process name. Any process
+         reading lsass.exe memory is suspicious — Windows itself has very few
+         legitimate reasons to do this (WER, certain AV products).
+
+       REDUCING FALSE POSITIVES:
+         Known false positive sources:
+           - Windows Error Reporting (WerFault.exe) accessing lsass after crash
+           - Some AV/EDR products that monitor LSASS
+           - Microsoft Defender credential harvesting protection
+         To exclude these, add:
+           <field name="win.eventdata.sourceImage" negate="yes" type="pcre2">
+             (?i)(WerFault|MsMpEng|SenseIR|CylanceSvc)\.exe$
+           </field>
+
+       SYSMON CONFIGURATION REQUIRED:
+         Your Sysmon config must have ProcessAccess logging enabled with
+         lsass.exe as a target. Add to sysmonconfig.xml:
+           <ProcessAccess onmatch="include">
+             <TargetImage condition="is">C:\Windows\system32\lsass.exe</TargetImage>
+           </ProcessAccess>
+
+       RESPONSE: Isolate host immediately
+                 Assume all credentials on host are compromised
+                 Rotate passwords for all accounts used on this system
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100003" level="14">
+
+    <!-- Only process Windows events -->
+    <if_group>windows</if_group>
+
+    <!-- Sysmon Event ID 10 = ProcessAccess -->
+    <field name="win.system.eventID">^10$</field>
+
+    <!-- Target process must be lsass.exe (case-insensitive, end-anchored) -->
+    <field name="win.eventdata.targetImage" type="pcre2">(?i)lsass\.exe$</field>
+
+    <!-- Dynamic substitution: shows WHICH process accessed LSASS in the alert -->
+    <description>Credential dumping attempt: process $(win.eventdata.sourceImage) accessed LSASS memory on $(hostname)</description>
+
+    <mitre>
+      <id>T1003.001</id>   <!-- OS Credential Dumping: LSASS Memory -->
+    </mitre>
+
+    <group>credential_dumping,attack,pci_dss_10.6.1</group>
+
+  </rule>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100004 — PsExec Lateral Movement Detection
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         Detects the use of PsExec (and similar tools) for lateral movement.
+         PsExec works by:
+           1. Copying PSEXESVC.exe to the target's ADMIN$ share
+           2. Creating a service named PSEXESVC via the Service Control Manager
+           3. Executing commands via that service
+
+         This rule matches EITHER:
+           - Sysmon EID 1 (Process Create) where image path contains psexec
+           - Windows Security EID 7045 (New Service Installed) for PSEXESVC
+
+       MULTI-FIELD MATCHING:
+         The pipe "|" in field name="win.eventdata.image|win.eventdata.serviceName"
+         means: check EITHER of these fields. This is a Wazuh feature for
+         OR-matching across multiple decoded fields.
+
+       CATCHING RENAMED PSEXEC:
+         The regex catches: psexec, psexesvc, paexec (a PsExec clone).
+         It does NOT catch completely renamed variants — for those, use
+         Sysmon's hash-based matching with a blocklist of known PsExec hashes.
+
+       TUNING GUIDE:
+         If your environment legitimately uses PsExec for admin tasks:
+           1. Move this rule to level 8 (Medium) instead of 13
+           2. Add a <field name="win.eventdata.user" negate="yes"> exclusion
+              for known admin accounts that legitimately use PsExec
+           3. Create a separate rule at level 13 for PsExec by non-admin accounts
+
+       RESPONSE: Identify the source host (who executed PsExec)
+                 Identify the destination host (where PSEXESVC appeared)
+                 Use lateral-movement-playbook.md
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100004" level="13">
+
+    <if_group>windows</if_group>
+
+    <!-- Match process creation (EID 1) OR new service installed (EID 7045) -->
+    <field name="win.system.eventID">^1$|^7045$</field>
+
+    <!-- Either the image/binary name OR the service name contains PsExec variants -->
+    <!-- | = OR across multiple fields -->
+    <field name="win.eventdata.image|win.eventdata.serviceName" type="pcre2">(?i)(psexec|psexesvc|paexec)</field>
+
+    <description>Lateral movement via PsExec detected: $(win.eventdata.image) on $(hostname) — possible remote execution</description>
+
+    <mitre>
+      <id>T1021.002</id>   <!-- Remote Services: SMB/Windows Admin Shares -->
+      <id>T1570</id>        <!-- Lateral Tool Transfer -->
+    </mitre>
+
+    <group>lateral_movement,attack,pci_dss_10.6.1</group>
+
+  </rule>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100005 — Suspicious PowerShell Execution
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         Matches PowerShell process creation events (from either Sysmon EID 1
+         or Windows Security EID 4688) where the command line contains flags
+         and patterns overwhelmingly associated with malicious use:
+
+         PATTERNS DETECTED:
+           -enc / -EncodedCommand  : Base64-encoded payload (obfuscation)
+           -ep bypass              : Bypass execution policy restrictions
+           -ExecutionPolicy Bypass : Same as above, long form
+           IEX / Invoke-Expression : Execute strings as code (download cradles)
+           Net.WebClient           : .NET HTTP client (download tools)
+           DownloadString          : Downloads and executes from URL
+           DownloadFile            : Downloads file from URL
+           FromBase64String        : Decodes base64 payload
+           -nop / -NonInteractive  : Suppress user interaction (automation)
+           -WindowStyle Hidden     : Hide the PowerShell window (stealth)
+           WebRequest / Invoke-WebRequest: HTTP downloads
+
+       WHY TWO EVENT ID OPTIONS:
+         EID 1 (Sysmon): Captures command line BEFORE execution — more reliable
+         EID 4688 (Security): Available even without Sysmon — fallback detection
+         The "|" in eventID field matches either.
+
+       FIELD NAME PIPE TRICK:
+         win.eventdata.commandLine|win.eventdata.processCommandLine
+         These are different field names used by Sysmon vs Security logs.
+         Checking both ensures coverage regardless of log source.
+
+       TUNING GUIDE:
+         High false positive sources:
+           - Microsoft SCCM / Intune management scripts (often use -EncodedCommand)
+           - Ansible WinRM connections (uses encoded commands)
+           - Some backup software
+         To exclude known-good sources:
+           <field name="win.eventdata.parentImage" negate="yes" type="pcre2">
+             (?i)(CCMExec|sccm|ansible|chef|puppet)
+           </field>
+
+       RESPONSE: Decode the base64 payload (if present):
+                 [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<payload>'))
+                 Check if URL is malicious via VirusTotal
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100005" level="12">
+
+    <if_group>windows</if_group>
+
+    <!-- Match either Sysmon process create OR Security process create -->
+    <field name="win.system.eventID">^1$|^4688$</field>
+
+    <!-- The process being created must be PowerShell -->
+    <field name="win.eventdata.image|win.eventdata.newProcessName" type="pcre2">(?i)powershell(\.exe)?$</field>
+
+    <!-- The command line must contain suspicious flags/patterns -->
+    <!-- This long regex catches the most common malicious PS patterns -->
+    <field name="win.eventdata.commandLine|win.eventdata.processCommandLine" type="pcre2">(?i)(-enc|-EncodedCommand|-ep bypass|-ExecutionPolicy\s+Bypass|IEX|Invoke-Expression|Net\.WebClient|DownloadString|DownloadFile|FromBase64String|-nop|-NonInteractive|-WindowStyle\s+[Hh]idden|WebRequest|Invoke-WebRequest)</field>
+
+    <description>Suspicious PowerShell execution on $(hostname): encoded/download/bypass flags detected — $(win.eventdata.commandLine)</description>
+
+    <mitre>
+      <id>T1059.001</id>   <!-- Command and Scripting Interpreter: PowerShell -->
+    </mitre>
+
+    <group>attack,powershell,pci_dss_10.6.1</group>
+
+  </rule>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100006 — Ransomware Behaviour: Mass File Encryption
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         Uses two mechanisms together:
+           1. frequency="20" timeframe="30": fires only after 20 syscheck
+              (File Integrity Monitoring) events in 30 seconds — indicating
+              mass file modification, which is the hallmark of ransomware
+           2. Filename extension regex: the new file path must end with a
+              known ransomware extension to avoid false positives from
+              legitimate software that modifies many files quickly (backup
+              tools, compilers, package managers)
+
+       THE FREQUENCY + SYSCHECK APPROACH:
+         <if_matched_group>syscheck</if_matched_group> with frequency="20"
+         means: "fire when ANY 20 syscheck events matching this rule have
+         occurred in 30 seconds." This is a volume-based detection — it
+         catches ransomware even if it uses novel file extensions, as long as
+         the extension matches the known list.
+
+       THE EXTENSION LIST:
+         200+ known ransomware family extensions including:
+           WannaCry: .wncry .wcry
+           Locky: .locky .zepto
+           Cerber: .cerber
+           REvil/Sodinokibi: .revil
+           Conti: .conti
+           Ryuk: .ryuk
+           STOP/Djvu: .djvu .stop
+         Update this list as new families emerge.
+
+       WHY LEVEL 15:
+         Ransomware is the highest-impact threat to availability. Every second
+         of delay costs more encrypted files. Level 15 triggers the maximum
+         alert priority in any connected notification system.
+
+       TUNING GUIDE:
+         If you get false positives from backup software creating .encrypted
+         staging files, add a path exclusion:
+           <field name="syscheck.path" negate="yes" type="pcre2">
+             (?i)(backup|archive|vault)
+           </field>
+         Increase frequency to 50 if your environment has software that
+         legitimately renames many files quickly.
+
+       RESPONSE: IMMEDIATE HOST ISOLATION — every second matters
+                 Do NOT reboot (destroys memory evidence)
+                 Check if backups are intact before remediation
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100006" level="15" frequency="20" timeframe="30">
+
+    <!-- Parent group: fires when syscheck (FIM) events are matching -->
+    <if_matched_group>syscheck</if_matched_group>
+
+    <!-- The file path must end with a known ransomware extension -->
+    <!-- (?i) = case insensitive, $ = end of string anchor -->
+    <field name="syscheck.path" type="pcre2">(?i)\.(locked|encrypted|enc|crypt|crypto|vault|rrr|locky|zepto|cerber|thor|aaa|abc|xyz|crypted|cryptowall|ransom|pay|crypz|micro|cryptolocker|wncry|wcry|wanacry|satan|petya|notpetya|globe|jaff|dharma|phobos|stop|djvu|sodinokibi|revil|maze|egregor|conti|ryuk|darkside)$</field>
+
+    <description>RANSOMWARE BEHAVIOR: Mass file encryption detected on $(hostname) — $(syscheck.path) — ISOLATE IMMEDIATELY</description>
+
+    <mitre>
+      <id>T1486</id>   <!-- Data Encrypted for Impact -->
+    </mitre>
+
+    <group>ransomware,attack,critical,pci_dss_10.6.1</group>
+
+  </rule>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100007 — Registry Run Key Persistence
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         Detects writes to the Windows autorun registry keys via Sysmon
+         Event ID 13 (RegistryValueSet). These keys cause arbitrary programs
+         to execute at user login or system boot — the most common persistence
+         mechanism used by malware, RATs, and APTs.
+
+       REGISTRY PATHS MONITORED:
+         HKLM\Software\Microsoft\Windows\CurrentVersion\Run
+           → Runs for ALL users at login
+         HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce
+           → Runs ONCE for all users (used by installers AND malware)
+         HKLM\Software\Wow6432Node\...\Run
+           → 32-bit autorun on 64-bit Windows
+         HKLM\System\CurrentControlSet\Services
+           → Service creation (used by rootkits and malicious drivers)
+         HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+           → Winlogon notification (used for DLL injection persistence)
+         HKCU\...\Run
+           → Per-user autorun (lower privilege, but very commonly abused)
+
+       SYSMON EVENT ID 13:
+         EID 13 = RegistryValueSet — fires when a registry value is written.
+         The field win.eventdata.targetObject contains the full registry path.
+         win.eventdata.image contains the process that made the write.
+
+       TUNING GUIDE:
+         Common legitimate writers to these keys:
+           - Software installers (msiexec.exe, setup.exe)
+           - Windows Update
+           - OneDrive, Teams, Zoom auto-updaters
+         To reduce noise from known-good apps:
+           <field name="win.eventdata.image" negate="yes" type="pcre2">
+             (?i)(msiexec|OneDriveSetup|Teams|Zoom|MicrosoftEdge)
+           </field>
+         But be careful — attackers masquerade as legitimate process names.
+
+       RESPONSE: Check what value was written to the key
+                 Investigate the process that wrote it
+                 Correlate with rule 100005 (suspicious PowerShell)
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100007" level="12">
+
+    <if_group>windows</if_group>
+
+    <!-- EID 13 = Sysmon RegistryValueSet event -->
+    <field name="win.system.eventID">^13$</field>
+
+    <!-- The registry key path must be one of the persistence locations -->
+    <!-- (?i) = case-insensitive, handles HKLM vs hklm, etc. -->
+    <!-- Note: backslashes are doubled in XML (\ becomes \\) -->
+    <field name="win.eventdata.targetObject" type="pcre2">(?i)\\(HKLM|HKCU|HKU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)\\(Software\\Microsoft\\Windows\\CurrentVersion\\Run|Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run|System\\CurrentControlSet\\Services|SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon)</field>
+
+    <description>Persistence via registry Run key: $(win.eventdata.targetObject) modified by $(win.eventdata.image) on $(hostname)</description>
+
+    <mitre>
+      <id>T1547.001</id>   <!-- Boot or Logon Autostart Execution: Registry Run Keys -->
+    </mitre>
+
+    <group>persistence,attack,pci_dss_10.6.1</group>
+
+  </rule>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100008 — Suspicious Scheduled Task Creation
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         Detects creation of scheduled tasks with suspicious characteristics
+         using two detection paths:
+           Path A: Windows Security EID 4698 (A scheduled task was created)
+                   combined with a regex check on the task content/command
+           Path B: Sysmon EID 1 (Process Create) where schtasks.exe is
+                   called with suspicious arguments
+
+       THE SUSPICIOUS ARGUMENT PATTERNS:
+         /sc onstart      → Runs at system startup (persistence)
+         /sc onlogon      → Runs at every user login (persistence)
+         /ru system       → Runs as SYSTEM (privilege escalation)
+         /tr ...\temp\    → Binary in temp directory (malware staging)
+         /tr ...\appdata\ → Binary in AppData (user-writable, malware staging)
+         powershell       → Task runs PowerShell (combine with rule 100005)
+         cmd.exe /c ...\temp → CMD running something from temp
+         base64/encoded   → Encoded payload in task action
+
+       WHY BOTH EID 4698 AND EID 1:
+         4698 gives you the task XML content — better for detecting malicious
+         task configurations. EID 1 gives you the schtasks.exe command line —
+         better for catching creation via command line tools.
+         Matching either ensures maximum coverage.
+
+       TUNING GUIDE:
+         Legitimate scheduled tasks in enterprises are common. Reduce noise by:
+           1. Excluding known software: SCCM, Intune, backup agents
+           2. Only alerting on /ru system + non-standard directories combo
+           3. Creating a whitelist of known-good task names in a CDB list
+
+       RESPONSE: Review full task definition in Task Scheduler
+                 Check binary the task executes (hash it)
+                 Determine if task was created by a legitimate admin
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100008" level="12">
+
+    <if_group>windows</if_group>
+
+    <!-- Match Security EID 4698 (task created) OR Sysmon EID 1 (process create) -->
+    <field name="win.system.eventID">^4698$|^1$</field>
+
+    <!-- Task name or command line must contain suspicious indicators -->
+    <field name="win.eventdata.taskName|win.eventdata.commandLine" type="pcre2">(?i)(schtasks|taskschd).*(/sc\s+onstart|/sc\s+onlogon|/ru\s+system|/tr\s+.*\\(temp|tmp|appdata|programdata)\\|powershell|cmd\.exe\s+/c\s+.*\\(temp|tmp)|\\AppData\\|base64|encoded)</field>
+
+    <description>Suspicious scheduled task created on $(hostname): $(win.eventdata.taskName) — check for persistence mechanism</description>
+
+    <mitre>
+      <id>T1053.005</id>   <!-- Scheduled Task/Job: Scheduled Task -->
+    </mitre>
+
+    <group>persistence,attack,pci_dss_10.6.1</group>
+
+  </rule>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100009 — Outbound Connection to Suspicious Ports (Possible C2)
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         Monitors Sysmon EID 3 (NetworkConnect) events for outbound connections
+         to port numbers that are overwhelmingly associated with:
+           - Metasploit reverse shells (4444, 4445)
+           - Hacker culture / memes (1337, 31337 = "leet")
+           - Common C2 frameworks (8888, 9999)
+           - IRC (6666–6669) — used by older botnets
+           - SOCKS proxies (1080, 3128)
+           - Common C2 over HTTP-like ports (8080, 8443, 9090)
+
+       LIMITATIONS AND UPGRADE PATH:
+         This rule uses a hardcoded port list — a simplification for the lab.
+         In production, replace this with:
+           1. A Wazuh CDB (Constant Database) list of known-bad IPs from
+              threat intel feeds (Emerging Threats, AlienVault OTX, etc.)
+           2. Anomaly-based detection on ports that are unusual for THIS
+              specific endpoint (requires baseline period)
+           3. DNS-based detection for C2 domain generation algorithms (DGA)
+
+       WHY THESE SPECIFIC PORTS:
+         Port 4444: Default Metasploit meterpreter listener
+         Port 1337: "Leet" — used in many CTF/red team tools as default
+         Port 31337: "Elite" — classic backdoor/netcat listen port
+         Port 8888/9999: Common custom C2 framework defaults
+         Port 6666-6669: IRC — botnet C2 communication channel
+         Port 1080: SOCKS proxy — often used for tunneling C2 traffic
+
+       TUNING GUIDE:
+         Remove ports that your environment legitimately uses. For example:
+           - Port 8080 is used by many web apps (remove if you have dev servers)
+           - Port 3128 is Squid proxy (remove if you use Squid)
+         Add ports specific to tools used in your threat model.
+
+       UPGRADE TO CDB LIST (recommended for production):
+         Create /var/ossec/etc/lists/malicious-ips.txt
+         Add rule: <match_field name="win.eventdata.destinationIp">
+                     <list field="win.eventdata.destinationIp" lookup="match_key">
+                       etc/lists/malicious-ips
+                     </list>
+                   </match_field>
+
+       RESPONSE: Check if connection succeeded or was blocked
+                 Identify the process that made the connection
+                 Isolate if confirmed C2 communication
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100009" level="10">
+
+    <if_group>windows,linux</if_group>
+
+    <!-- Sysmon EID 3 = NetworkConnect -->
+    <field name="win.system.eventID|data.eventid">^3$</field>
+
+    <!-- Destination port must be one of the suspicious C2 ports -->
+    <!-- ^ and $ anchors prevent partial matches (e.g. port 44444 won't match 4444) -->
+    <field name="win.eventdata.destinationPort|data.dstport" type="pcre2">^(4444|4445|1337|31337|8888|9999|6666|6667|6668|6669|1080|3128|8080|8443|8888|9090)$</field>
+
+    <description>Suspicious outbound connection: $(win.eventdata.image) connecting to $(win.eventdata.destinationIp):$(win.eventdata.destinationPort) — possible C2 or proxy</description>
+
+    <mitre>
+      <id>T1071</id>    <!-- Application Layer Protocol (C2 communication) -->
+      <id>T1041</id>    <!-- Exfiltration Over C2 Channel -->
+    </mitre>
+
+    <group>network,c2,attack,pci_dss_1.3.4</group>
+
+  </rule>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════════════
+       RULE 100010 — Large File Transfer / Data Exfiltration Attempt
+       ══════════════════════════════════════════════════════════════════════════
+
+       WHAT IT DOES:
+         Detects command-line usage of common data transfer tools (curl, wget,
+         scp, rsync, netcat, certutil) with flags indicating large transfers
+         or piping to network destinations. These patterns are strongly
+         associated with data exfiltration.
+
+       TOOLS MONITORED AND WHY:
+         curl      : Most versatile HTTP exfil tool — supports PUT/POST of files
+         wget      : HTTP download/upload — less common for exfil but possible
+         scp       : SSH copy — legitimate admin tool, suspicious off-hours
+         rsync     : Sync large directories — attacker favourite for exfil
+         nc/ncat   : Raw TCP streams — simplest exfil method possible
+         certutil  : Windows LOLBin — base64 encodes/decodes files, used for exfil
+         bitsadmin : Windows LOLBin — Background Intelligent Transfer Service
+
+       FLAG PATTERNS:
+         -T <largenum>      : curl upload with large size (>10000 bytes)
+         -b <largenum>      : byte range
+         --data-binary      : Sends raw binary data (file upload)
+         | nc/curl/wget     : Pipes output directly to network (classic exfil)
+         --limit-rate [MG]  : Throttled transfer (attackers evade rate limits)
+
+       LIMITATIONS:
+         This rule catches OBVIOUS exfiltration using standard tools.
+         Sophisticated attackers will:
+           - Use encrypted channels (HTTPS) — needs SSL inspection
+           - Use cloud storage APIs (Google Drive, Dropbox, OneDrive)
+           - Use DNS tunneling — needs DNS query monitoring
+           - Use small, slow transfers to avoid volume detection
+         This rule is layer 1 of a multi-layer exfil detection strategy.
+
+       TUNING GUIDE:
+         If your admins legitimately use rsync for backups:
+           Add exclusion for the backup service account user
+           Add exclusion for known-good destination IPs (backup server)
+         If developers use curl heavily:
+           Scope this rule to servers only (agent group filter)
+
+       RESPONSE: Capture the full command line as evidence
+                 Check destination IP/domain via threat intel
+                 Estimate data volume transferred
+                 Preserve network logs for forensics
+       ══════════════════════════════════════════════════════════════════════════ -->
+  <rule id="100010" level="12">
+
+    <if_group>windows,linux</if_group>
+
+    <!-- Match network connection events OR process creation events -->
+    <field name="win.system.eventID|data.eventid">^3$|^1$</field>
+
+    <!-- Command line or image must contain data transfer tool + large-transfer flag -->
+    <!-- This long regex catches the most common exfil command patterns -->
+    <field name="win.eventdata.commandLine|data.command|win.eventdata.image" type="pcre2">(?i)(curl|wget|scp|rsync|ftp|sftp|nc|ncat|netcat|certutil|bitsadmin).*((-T\s+[1-9]\d{4,})|(-b\s+[1-9]\d{4,})|(--limit-rate\s+[0-9]+[MG])|(--data-binary)|(\|\s*(nc|ncat|netcat|curl|wget)))</field>
+
+    <description>Potential data exfiltration on $(hostname): large transfer tool detected — $(win.eventdata.commandLine) to $(win.eventdata.destinationIp)</description>
+
+    <mitre>
+      <id>T1048</id>   <!-- Exfiltration Over Alternative Protocol -->
+      <id>T1030</id>   <!-- Data Transfer Size Limits -->
+    </mitre>
+
+    <group>exfiltration,attack,pci_dss_4.1</group>
+
+  </rule>
+
+</group>

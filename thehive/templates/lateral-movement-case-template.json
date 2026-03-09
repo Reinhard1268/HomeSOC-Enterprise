@@ -1,0 +1,105 @@
+{
+  "_meta": {
+    "description": "TheHive 5 case template for lateral movement incidents",
+    "author": "SOC Lab Project",
+    "version": "1.0.0",
+    "mitre": ["T1021.002", "T1570", "T1550", "T1076", "T1078"]
+  },
+  "name": "Lateral Movement",
+  "titlePrefix": "[LM]",
+  "description": "## Lateral Movement Incident\n\nThis case is opened when Wazuh detects an attacker or malware attempting to move from one compromised host to other systems within the network. Common indicators include PsExec execution (rule 100004), pass-the-hash activity, RDP from unexpected sources, SMB enumeration, or Cobalt Strike beacon movement.\n\n### Severity Guide\n- **Medium**: Single lateral hop detected, contained to one subnet\n- **High**: Multiple hops, domain credentials used, admin shares accessed\n- **Critical**: Domain controller reached, Active Directory compromised\n\n### Key Questions\n1. What was the source (pivot) host?\n2. What technique was used to move laterally?\n3. What credentials were used — and are they compromised?\n4. How many hosts have been reached?\n5. Has a domain controller or critical system been touched?",
+  "severity": 3,
+  "tlp": 3,
+  "pap": 2,
+  "tags": [
+    "lateral-movement",
+    "T1021.002",
+    "T1570",
+    "wazuh-alert",
+    "psexec",
+    "windows",
+    "smb"
+  ],
+  "tasks": [
+    {
+      "order": 0,
+      "title": "TRIAGE — Map the Movement",
+      "group": "Triage",
+      "description": "## Triage Steps\n\n1. Identify source host (pivot point) and destination host(s) from Wazuh alert\n2. Confirm technique: PsExec (rule 100004), RDP, WMI, SMB, WinRM, etc.\n3. Check Kibana for correlated events:\n   - Use saved search `[SOC] Outbound Network Connections by Process`\n   - Filter by source host, look for SMB (445), RDP (3389), WinRM (5985)\n4. Identify credentials used:\n   - Windows Event 4648 (explicit credential logon)\n   - Windows Event 4624 LogonType 3 (network logon)\n5. Check if this is part of a larger campaign:\n   - Has same attacker IP appeared on other agents?\n   - Is there an active brute force or malware case?\n6. Escalate immediately if domain controller is involved\n\n**Expected output:** Source/destination map, technique identified, credentials flagged"
+    },
+    {
+      "order": 1,
+      "title": "CONTAINMENT — Segment and Isolate",
+      "group": "Containment",
+      "description": "## Containment Steps\n\n### Isolate All Affected Hosts\n1. Identify ALL hosts the attacker has touched (check Kibana 4624 LogonType 3 events)\n2. For each compromised host:\n   ```powershell\n   # Block SMB and RDP at host firewall\n   New-NetFirewallRule -DisplayName 'INCIDENT-BLOCK-SMB' -Direction Inbound -LocalPort 445 -Protocol TCP -Action Block\n   New-NetFirewallRule -DisplayName 'INCIDENT-BLOCK-RDP' -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Block\n   ```\n3. Block the source host from accessing all other systems:\n   ```powershell\n   # On network infrastructure — block source IP\n   New-NetFirewallRule -DisplayName 'INCIDENT-BLOCK-PIVOT' -Direction Outbound -RemoteAddress <pivot_ip> -Action Block\n   ```\n4. If PSEXESVC service is running — stop and disable it:\n   ```powershell\n   Stop-Service PSEXESVC -Force\n   Set-Service PSEXESVC -StartupType Disabled\n   ```\n5. Disable compromised accounts in Active Directory immediately:\n   ```powershell\n   Disable-ADAccount -Identity <compromised_user>\n   ```\n\n**Expected output:** All affected hosts isolated, compromised accounts disabled"
+    },
+    {
+      "order": 2,
+      "title": "INVESTIGATION — Trace the Attack Path",
+      "group": "Investigation",
+      "description": "## Investigation Steps\n\n### On the Pivot (Source) Host\n```powershell\n# What did the attacker run via PsExec / WMI?\nGet-WinEvent -LogName Security | Where-Object {$_.Id -eq 4688} |\n  Select-Object TimeCreated,Message | Format-List\n\n# Check PSEXESVC logs\nGet-ChildItem C:\\Windows\\PSEXESVC.exe\nGet-WinEvent -LogName System | Where-Object {$_.Id -eq 7045}\n```\n\n### Credential Theft Assessment\n```powershell\n# Was LSASS accessed? (correlate with Wazuh rule 100003)\nGet-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' |\n  Where-Object {$_.Id -eq 10 -and $_.Message -like '*lsass*'}\n\n# List accounts with recent logons\nGet-WinEvent -LogName Security | Where-Object {$_.Id -eq 4624} |\n  Select-Object -First 50\n```\n\n### On Destination Hosts\n```powershell\n# What was executed on the destination?\nGet-WinEvent -LogName Security | Where-Object {$_.Id -in 4624,4625,4648,4688} |\n  Select-Object TimeCreated,Id,Message | Format-List\n\n# Were admin shares accessed?\nGet-WinEvent -LogName Security | Where-Object {$_.Id -eq 5140}\n```\n\n### Network-level Pivot Tracing\n```bash\n# On Linux hosts — check for unusual SMB / RDP connections\nss -tulpn | grep -E ':445|:3389|:5985'\ngrep -i 'smb\\|samba\\|winrm' /var/log/syslog\n```\n\n**Expected output:** Complete attack path documented hop by hop"
+    },
+    {
+      "order": 3,
+      "title": "ERADICATION — Remove Attacker Presence",
+      "group": "Eradication",
+      "description": "## Eradication Steps\n\n1. Remove PsExec service artefacts from all affected hosts:\n   ```powershell\n   Stop-Service PSEXESVC -Force -ErrorAction SilentlyContinue\n   Remove-Item C:\\Windows\\PSEXESVC.exe -Force -ErrorAction SilentlyContinue\n   sc.exe delete PSEXESVC\n   ```\n2. Remove any backdoor accounts created by attacker:\n   ```powershell\n   # Find accounts created in last 48h\n   Get-ADUser -Filter * -Properties WhenCreated |\n     Where-Object {$_.WhenCreated -gt (Get-Date).AddHours(-48)}\n   ```\n3. Revoke and rotate all compromised credentials:\n   ```powershell\n   # Force password reset for all affected accounts\n   Set-ADAccountPassword -Identity <user> -Reset -NewPassword (ConvertTo-SecureString -String (New-Guid) -AsPlainText -Force)\n   Set-ADUser -Identity <user> -ChangePasswordAtLogon $true\n   ```\n4. Clear scheduled tasks and services planted on destination hosts\n5. Remove malware/tools dropped by attacker:\n   ```powershell\n   # Common drop locations\n   Get-ChildItem C:\\Windows\\Temp, C:\\Users\\Public, C:\\ProgramData -Recurse -ErrorAction SilentlyContinue\n   ```\n\n**Expected output:** All attacker artefacts removed, credentials rotated"
+    },
+    {
+      "order": 4,
+      "title": "RECOVERY — Harden and Restore",
+      "group": "Recovery",
+      "description": "## Recovery Steps\n\n1. Re-enable isolated hosts after clean verification\n2. Apply SMB/RDP hardening:\n   ```powershell\n   # Disable SMBv1\n   Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force\n   \n   # Restrict RDP access to specific IPs only\n   New-NetFirewallRule -DisplayName 'RDP-Restricted' -Direction Inbound `\n     -LocalPort 3389 -Protocol TCP -RemoteAddress <admin_ip> -Action Allow\n   ```\n3. Implement Local Admin Password Solution (LAPS) if not in place\n4. Enable Credential Guard on Windows 10/11 hosts\n5. Audit and remove unnecessary admin shares:\n   ```powershell\n   Get-SmbShare | Where-Object {$_.Special -eq $false}\n   ```\n6. Verify Wazuh agents healthy on all affected hosts\n7. Confirm Sysmon is running and capturing lateral movement indicators\n\n**Expected output:** Hardened configuration applied across all affected hosts"
+    },
+    {
+      "order": 5,
+      "title": "POST-INCIDENT — Document Full Campaign",
+      "group": "Post-Incident",
+      "description": "## Post-Incident Steps\n\n1. Draw full attack graph (pivot host → destination hosts → accounts used)\n2. Map entire incident to MITRE ATT&CK:\n   - Initial Access technique\n   - Credential access technique\n   - Lateral movement technique\n   - Any impact techniques\n3. Calculate total dwell time (first alert → containment)\n4. Document all IOCs:\n   - Source IPs\n   - Tools used (PsExec hash, etc.)\n   - Accounts compromised\n   - Hosts affected\n5. File formal incident report using IR-002 template\n6. Update Wazuh rules if coverage gaps identified\n7. Brief IT/security team on detection improvements\n\n**Expected output:** Full campaign documented, IR filed, detection gaps closed"
+    }
+  ],
+  "customFields": [
+    {
+      "name": "pivotHost",
+      "description": "Source / pivot host used for lateral movement",
+      "type": "string",
+      "mandatory": true
+    },
+    {
+      "name": "destinationHosts",
+      "description": "Comma-separated list of destination hosts reached",
+      "type": "string",
+      "mandatory": true
+    },
+    {
+      "name": "movementTechnique",
+      "description": "Technique used (PsExec, RDP, WMI, WinRM, Pass-the-Hash, etc.)",
+      "type": "string",
+      "mandatory": true
+    },
+    {
+      "name": "compromisedAccounts",
+      "description": "Accounts used or compromised during lateral movement",
+      "type": "string",
+      "mandatory": true
+    },
+    {
+      "name": "domainControllerReached",
+      "description": "Was a domain controller accessed? (yes/no/unknown)",
+      "type": "string",
+      "mandatory": true
+    },
+    {
+      "name": "totalHostsAffected",
+      "description": "Total number of hosts touched by the attacker",
+      "type": "integer",
+      "mandatory": false
+    },
+    {
+      "name": "dwellTimeHours",
+      "description": "Estimated time attacker was in environment (hours)",
+      "type": "integer",
+      "mandatory": false
+    }
+  ]
+}

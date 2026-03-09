@@ -1,0 +1,104 @@
+{
+  "_meta": {
+    "description": "TheHive 5 case template for SSH/RDP brute force incidents",
+    "author": "SOC Lab Project",
+    "version": "1.0.0",
+    "mitre": ["T1110.001", "T1078"]
+  },
+  "name": "Brute Force Attack",
+  "titlePrefix": "[BF]",
+  "description": "## Brute Force Authentication Attack\n\nThis case is opened when Wazuh detects 10 or more failed authentication attempts from a single source IP within a 60-second window, with optional correlation to a subsequent successful login.\n\n### Severity Guide\n- **Low**: Failed attempts only, source is known scanner (Shodan, Censys)\n- **Medium**: High volume of failures, unknown source\n- **High**: Failures followed by successful login\n- **Critical**: Successful login + lateral movement indicators\n\n### Key Questions\n1. Did the brute force succeed (rule 100002 fired)?\n2. Is the source IP associated with known threat actors?\n3. Was the targeted account privileged?\n4. Were any commands run post-authentication?",
+  "severity": 2,
+  "tlp": 2,
+  "pap": 2,
+  "tags": [
+    "brute-force",
+    "authentication",
+    "T1110.001",
+    "wazuh-alert",
+    "ssh",
+    "initial-access"
+  ],
+  "tasks": [
+    {
+      "order": 0,
+      "title": "TRIAGE — Validate Alert",
+      "group": "Triage",
+      "description": "## Triage Steps\n\n1. Open Wazuh Dashboard — confirm rule 100001 or 100002 fired\n2. Note the source IP, targeted username, and timestamp\n3. Check if rule 100002 (success after brute force) also fired\n4. Query Kibana saved search: `[SOC] Failed + Successful Logins by Source IP`\n5. Confirm this is NOT a known scanner (check GreyNoise / Shodan)\n6. Set case severity based on severity guide in description\n7. Assign case to analyst\n\n**Expected output:** Confirmed IP, targeted account, success/failure status"
+    },
+    {
+      "order": 1,
+      "title": "CONTAINMENT — Block Source IP",
+      "group": "Containment",
+      "description": "## Containment Steps\n\n1. Confirm the attacker IP from Wazuh alert field `data.srcip`\n2. Check if IP is still actively attacking:\n   ```bash\n   grep <attacker_ip> /var/log/auth.log | tail -20\n   ```\n3. Block IP at host firewall:\n   ```bash\n   sudo ufw deny from <attacker_ip> to any\n   # OR for iptables:\n   sudo iptables -I INPUT -s <attacker_ip> -j DROP\n   ```\n4. If brute force succeeded — isolate compromised host from network\n5. Document block action with timestamp and rule used\n6. Verify block is effective:\n   ```bash\n   sudo ufw status numbered\n   ```\n\n**Expected output:** IP blocked, logged, and verified"
+    },
+    {
+      "order": 2,
+      "title": "INVESTIGATION — Analyse Login Activity",
+      "group": "Investigation",
+      "description": "## Investigation Steps\n\n1. If login succeeded, check what the attacker did:\n   ```bash\n   # Review auth log for the compromised account\n   grep <username> /var/log/auth.log\n   \n   # Check bash history\n   cat /home/<username>/.bash_history\n   cat /root/.bash_history\n   \n   # Check for new files\n   find / -newer /tmp -type f 2>/dev/null | grep -v proc\n   \n   # Check active sessions\n   who -a\n   last -n 30\n   ```\n2. Check for privilege escalation post-login:\n   ```bash\n   grep sudo /var/log/auth.log | grep <username>\n   ```\n3. Check for lateral movement (new outbound connections):\n   ```bash\n   ss -tulpn\n   netstat -an | grep ESTABLISHED\n   ```\n4. Correlate in Kibana — search by `data.srcip` across all rule groups\n5. GeoIP lookup the attacker IP\n6. Check IP against threat intel (VirusTotal, AbuseIPDB)\n\n**Expected output:** Full timeline of attacker activity if login succeeded"
+    },
+    {
+      "order": 3,
+      "title": "ERADICATION — Remove Attacker Foothold",
+      "group": "Eradication",
+      "description": "## Eradication Steps (if login succeeded)\n\n1. Lock or disable the compromised account:\n   ```bash\n   sudo passwd -l <username>\n   # OR\n   sudo usermod --expiredate 1 <username>\n   ```\n2. Rotate SSH keys for the affected account:\n   ```bash\n   rm /home/<username>/.ssh/authorized_keys\n   ```\n3. Check for persistence mechanisms:\n   ```bash\n   crontab -l -u <username>\n   cat /etc/cron.d/*\n   ls /etc/cron.daily/ /etc/cron.hourly/\n   grep <username> /etc/passwd\n   ls -la /home/<username>/.bashrc /home/<username>/.profile\n   ```\n4. Remove any unauthorized accounts created:\n   ```bash\n   awk -F: '$3 >= 1000 {print $1}' /etc/passwd\n   ```\n5. Scan for backdoors / webshells:\n   ```bash\n   find /var/www /tmp /dev/shm -name '*.php' -o -name '*.sh' 2>/dev/null\n   ```\n\n**Expected output:** Attacker access revoked, persistence removed"
+    },
+    {
+      "order": 4,
+      "title": "RECOVERY — Restore & Harden",
+      "group": "Recovery",
+      "description": "## Recovery Steps\n\n1. Re-enable account after password reset (if legitimate user):\n   ```bash\n   sudo passwd <username>   # Set strong password\n   sudo passwd -u <username> # Unlock account\n   ```\n2. Harden SSH configuration:\n   ```bash\n   sudo nano /etc/ssh/sshd_config\n   # Set:\n   #   PasswordAuthentication no\n   #   PermitRootLogin no\n   #   MaxAuthTries 3\n   #   AllowUsers <specific_users>\n   sudo systemctl restart sshd\n   ```\n3. Install / configure fail2ban if not present:\n   ```bash\n   sudo apt install fail2ban -y\n   sudo systemctl enable --now fail2ban\n   ```\n4. Verify Wazuh active-response is configured to auto-block repeat offenders\n5. Confirm monitoring is restored and alerting works\n\n**Expected output:** Service hardened, monitoring confirmed"
+    },
+    {
+      "order": 5,
+      "title": "POST-INCIDENT — Document & Report",
+      "group": "Post-Incident",
+      "description": "## Post-Incident Steps\n\n1. Complete timeline in case description\n2. Fill in all custom fields (source IP, targeted account, outcome)\n3. Export Wazuh alert data as evidence attachment\n4. Write lessons learned:\n   - What detection worked?\n   - What could be improved?\n   - Were thresholds appropriate?\n5. Update IP blocklist / threat intel feed\n6. File formal incident report using IR-001 template\n7. Close case with resolution summary\n\n**Expected output:** Case closed, report filed, improvements logged"
+    }
+  ],
+  "customFields": [
+    {
+      "name": "attackerIP",
+      "description": "Source IP of the brute force attack",
+      "type": "string",
+      "mandatory": true
+    },
+    {
+      "name": "targetedAccount",
+      "description": "Username targeted by the attack",
+      "type": "string",
+      "mandatory": true
+    },
+    {
+      "name": "targetedHost",
+      "description": "Hostname or IP of the attacked system",
+      "type": "string",
+      "mandatory": true
+    },
+    {
+      "name": "loginSucceeded",
+      "description": "Did any login attempt succeed? (yes/no)",
+      "type": "string",
+      "mandatory": true
+    },
+    {
+      "name": "wazuhRuleID",
+      "description": "Wazuh rule ID that triggered this case",
+      "type": "string",
+      "mandatory": false
+    },
+    {
+      "name": "ipReputation",
+      "description": "IP reputation from VirusTotal / AbuseIPDB",
+      "type": "string",
+      "mandatory": false
+    },
+    {
+      "name": "failedAttemptCount",
+      "description": "Total number of failed login attempts",
+      "type": "integer",
+      "mandatory": false
+    }
+  ]
+}

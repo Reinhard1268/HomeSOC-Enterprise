@@ -1,0 +1,338 @@
+# =============================================================================
+# docker-compose.yml —  Home SOC Lab Full Stack
+# Services: Wazuh (manager + indexer + dashboard), Elasticsearch, Kibana,
+#           TheHive 5, Cassandra (TheHive backend), Shuffle SOAR
+# Usage: docker compose --env-file .env up -d
+# =============================================================================
+
+version: "3.8"
+
+# ── Shared network ─────────────────────────────────────────────────────────────
+networks:
+  soc-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+# ── Persistent volumes ─────────────────────────────────────────────────────────
+volumes:
+  wazuh-indexer-data:
+  wazuh-manager-etc:
+  wazuh-manager-var:
+  wazuh-manager-logs:
+  wazuh-manager-queue:
+  wazuh-manager-multi-groups:
+  wazuh-manager-ossec-logs:
+  wazuh-manager-api-configuration:
+  wazuh-manager-integrations:
+  wazuh-manager-active-response:
+  wazuh-manager-agentless:
+  wazuh-manager-wodles:
+  wazuh-dashboard-config:
+  wazuh-dashboard-custom:
+  elasticsearch-data:
+  kibana-data:
+  thehive-data:
+  cassandra-data:
+  shuffle-data:
+  shuffle-db:
+
+services:
+
+  # ── Wazuh Indexer (OpenSearch) ──────────────────────────────────────────────
+  wazuh-indexer:
+    image: wazuh/wazuh-indexer:${WAZUH_VERSION:-4.7.3}
+    container_name: wazuh-indexer
+    hostname: wazuh-indexer
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.10
+    ports:
+      - "9201:9200"
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${WAZUH_MANAGER_PASSWORD}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sk https://localhost:9200 -u admin:${WAZUH_MANAGER_PASSWORD} | grep -q '\"status\" : \"green\\|yellow\"' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  # ── Wazuh Manager ───────────────────────────────────────────────────────────
+  wazuh-manager:
+    image: wazuh/wazuh-manager:${WAZUH_VERSION:-4.7.3}
+    container_name: wazuh-manager
+    hostname: wazuh-manager
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.11
+    ports:
+      - "1514:1514/udp"   # Agent communication
+      - "1515:1515"       # Agent enrollment
+      - "514:514/udp"     # Syslog
+      - "55000:55000"     # Wazuh API
+    environment:
+      - INDEXER_URL=https://wazuh-indexer:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${WAZUH_MANAGER_PASSWORD}
+      - FILEBEAT_SSL_VERIFICATION_MODE=none
+      - SSL_CERTIFICATE_AUTHORITIES=/etc/ssl/root-ca.pem
+      - SSL_CERTIFICATE=/etc/ssl/filebeat.pem
+      - SSL_KEY=/etc/ssl/filebeat.key
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=${WAZUH_MANAGER_PASSWORD}
+    volumes:
+      - wazuh-manager-etc:/var/ossec/etc
+      - wazuh-manager-var:/var/ossec/var
+      - wazuh-manager-logs:/var/ossec/logs
+      - wazuh-manager-queue:/var/ossec/queue
+      - wazuh-manager-multi-groups:/var/ossec/multi-groups
+      - wazuh-manager-ossec-logs:/var/ossec/logs/ossec
+      - wazuh-manager-api-configuration:/var/ossec/api/configuration
+      - wazuh-manager-integrations:/var/ossec/integrations
+      - wazuh-manager-active-response:/var/ossec/active-response
+      - wazuh-manager-agentless:/var/ossec/agentless
+      - wazuh-manager-wodles:/var/ossec/wodles
+      # Mount custom rules and decoders
+      - ../../wazuh/rules:/var/ossec/etc/rules/custom:ro
+      - ../../wazuh/decoders:/var/ossec/etc/decoders/custom:ro
+      - ../../wazuh/agents/ossec-linux.conf:/var/ossec/etc/shared/default/agent.conf:ro
+    depends_on:
+      wazuh-indexer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/var/ossec/bin/wazuh-control", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  # ── Wazuh Dashboard ─────────────────────────────────────────────────────────
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:${WAZUH_VERSION:-4.7.3}
+    container_name: wazuh-dashboard
+    hostname: wazuh-dashboard
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.12
+    ports:
+      - "443:5601"
+    environment:
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${WAZUH_MANAGER_PASSWORD}
+      - WAZUH_API_URL=https://wazuh-manager
+      - DASHBOARD_USERNAME=kibanaserver
+      - DASHBOARD_PASSWORD=${WAZUH_MANAGER_PASSWORD}
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=${WAZUH_MANAGER_PASSWORD}
+    volumes:
+      - wazuh-dashboard-config:/usr/share/wazuh-dashboard/data/wazuh/config
+      - wazuh-dashboard-custom:/usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom
+    depends_on:
+      wazuh-indexer:
+        condition: service_healthy
+      wazuh-manager:
+        condition: service_healthy
+
+  # ── Elasticsearch ───────────────────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION:-8.13.4}
+    container_name: elasticsearch
+    hostname: elasticsearch
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.20
+    ports:
+      - "9200:9200"
+    environment:
+      - node.name=elasticsearch
+      - cluster.name=soc-lab-cluster
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.enrollment.enabled=true
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -su elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+
+  # ── Kibana ──────────────────────────────────────────────────────────────────
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ELASTIC_VERSION:-8.13.4}
+    container_name: kibana
+    hostname: kibana
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.21
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+      - SERVER_NAME=kibana
+      - SERVER_HOST=0.0.0.0
+      - XPACK_SECURITY_ENABLED=true
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${THEHIVE_SECRET}
+    volumes:
+      - kibana-data:/usr/share/kibana/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q '\"overall\":{\"level\":\"available\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+
+  # ── Cassandra (TheHive 5 backend) ───────────────────────────────────────────
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    hostname: cassandra
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.30
+    environment:
+      - MAX_HEAP_SIZE=1G
+      - HEAP_NEWSIZE=256M
+      - CASSANDRA_CLUSTER_NAME=soc-thehive
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 30s
+      timeout: 10s
+      retries: 15
+
+  # ── TheHive 5 ───────────────────────────────────────────────────────────────
+  thehive:
+    image: strangebee/thehive:5.3
+    container_name: thehive
+    hostname: thehive
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.31
+    ports:
+      - "9000:9000"
+    environment:
+      - JVM_OPTS=-Xms512m -Xmx1g
+    command:
+      - --secret
+      - "${THEHIVE_SECRET}"
+      - "--cql-hostnames"
+      - "cassandra"
+      - "--index-backend"
+      - "elasticsearch"
+      - "--es-hostnames"
+      - "elasticsearch"
+      - "--es-port"
+      - "9200"
+      - "--es-protocol"
+      - "http"
+      - "--es-user"
+      - "elastic"
+      - "--es-password"
+      - "${ELASTIC_PASSWORD}"
+    volumes:
+      - thehive-data:/opt/thp/thehive/data
+      - ../../thehive/templates:/opt/thp/thehive/templates:ro
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9000/api/status | grep -q ''"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+
+  # ── Shuffle SOAR ────────────────────────────────────────────────────────────
+  shuffle-backend:
+    image: ghcr.io/shuffle/shuffle-backend:latest
+    container_name: shuffle-backend
+    hostname: shuffle-backend
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.40
+    ports:
+      - "5001:5001"
+    environment:
+      - DATASTORE_EMULATOR_HOST=shuffle-database:8000
+      - SHUFFLE_APP_HOTLOAD_FOLDER=/shuffle-apps
+      - SHUFFLE_FILE_LOCATION=/shuffle-files
+      - SHUFFLE_OPENSEARCH_URL=http://elasticsearch:9200
+      - SHUFFLE_OPENSEARCH_USERNAME=elastic
+      - SHUFFLE_OPENSEARCH_PASSWORD=${ELASTIC_PASSWORD}
+      - SHUFFLE_DEFAULT_USERNAME=admin
+      - SHUFFLE_DEFAULT_PASSWORD=${SHUFFLE_SECRET}
+      - SHUFFLE_DEFAULT_APIKEY=myshuffle_api_key_change_me
+      - ORG_ID=default
+      - ENVIRONMENT_NAME=soc-lab
+    volumes:
+      - shuffle-data:/shuffle-files
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../../shuffle/workflows:/shuffle-apps:ro
+    depends_on:
+      - shuffle-database
+
+  shuffle-frontend:
+    image: ghcr.io/shuffle/shuffle-frontend:latest
+    container_name: shuffle-frontend
+    hostname: shuffle-frontend
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.41
+    ports:
+      - "3001:80"
+      - "3443:443"
+    environment:
+      - BACKEND_HOSTNAME=shuffle-backend
+      - BACKEND_PORT=5001
+    depends_on:
+      - shuffle-backend
+
+  shuffle-database:
+    image: falkben/datastore-emulator:latest
+    container_name: shuffle-database
+    hostname: shuffle-database
+    restart: unless-stopped
+    networks:
+      soc-net:
+        ipv4_address: 172.20.0.42
+    ports:
+      - "8000:8000"
+    volumes:
+      - shuffle-db:/data

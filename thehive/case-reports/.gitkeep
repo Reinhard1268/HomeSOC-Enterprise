@@ -1,0 +1,5 @@
+# This directory is populated during live lab use.
+# Case reports are exported from TheHive as PDF/JSON after each incident.
+# Example filenames:
+#   case-20240115-BF-001.pdf
+#   case-20240118-MAL-002.json

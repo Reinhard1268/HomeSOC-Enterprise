@@ -1,0 +1,221 @@
+{
+  "_meta": {
+    "description": "Index template for Wazuh alerts with full field mappings for SOC Lab",
+    "author": "SOC Lab Project",
+    "version": "1.0.0"
+  },
+  "index_patterns": ["wazuh-alerts-*", "wazuh-archives-*"],
+  "priority": 500,
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "index.refresh_interval": "5s",
+      "index.mapping.total_fields.limit": 2000,
+      "index.query.default_field": [
+        "rule.description",
+        "agent.name",
+        "data.srcip",
+        "full_log"
+      ],
+      "index.lifecycle.name": "wazuh-alerts-policy",
+      "index.lifecycle.rollover_alias": "wazuh-alerts"
+    },
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "strings_as_keyword": {
+            "match_mapping_type": "string",
+            "unmatch": "*_text",
+            "mapping": {
+              "type": "keyword",
+              "ignore_above": 1024
+            }
+          }
+        },
+        {
+          "long_as_long": {
+            "match_mapping_type": "long",
+            "mapping": { "type": "long" }
+          }
+        }
+      ],
+      "properties": {
+
+        "@timestamp": { "type": "date" },
+
+        "agent": {
+          "properties": {
+            "id":   { "type": "keyword" },
+            "ip":   { "type": "ip"      },
+            "name": { "type": "keyword" },
+            "labels": {
+              "properties": {
+                "source": { "type": "keyword" }
+              }
+            }
+          }
+        },
+
+        "manager": {
+          "properties": {
+            "name": { "type": "keyword" }
+          }
+        },
+
+        "rule": {
+          "properties": {
+            "id":          { "type": "keyword" },
+            "level":       { "type": "integer" },
+            "description": {
+              "type": "text",
+              "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } }
+            },
+            "groups":  { "type": "keyword" },
+            "mitre": {
+              "properties": {
+                "id":      { "type": "keyword" },
+                "tactic":  { "type": "keyword" },
+                "technique": { "type": "keyword" }
+              }
+            },
+            "pci_dss":  { "type": "keyword" },
+            "gpg13":    { "type": "keyword" },
+            "hipaa":    { "type": "keyword" },
+            "nist_800_53": { "type": "keyword" },
+            "firedtimes": { "type": "integer" },
+            "frequency":  { "type": "integer" }
+          }
+        },
+
+        "data": {
+          "properties": {
+            "srcip":    { "type": "ip"      },
+            "dstip":    { "type": "ip"      },
+            "srcport":  { "type": "integer" },
+            "dstport":  { "type": "integer" },
+            "srcuser":  { "type": "keyword" },
+            "dstuser":  { "type": "keyword" },
+            "proto":    { "type": "keyword" },
+            "action":   { "type": "keyword" },
+            "status":   { "type": "keyword" },
+            "id":       { "type": "keyword" },
+            "url":      { "type": "keyword" },
+            "command":  { "type": "keyword" },
+            "eventid":  { "type": "keyword" }
+          }
+        },
+
+        "win": {
+          "properties": {
+            "system": {
+              "properties": {
+                "eventID":        { "type": "keyword" },
+                "providerName":   { "type": "keyword" },
+                "channel":        { "type": "keyword" },
+                "computer":       { "type": "keyword" },
+                "severityValue":  { "type": "keyword" },
+                "message": {
+                  "type": "text",
+                  "fields": { "keyword": { "type": "keyword", "ignore_above": 512 } }
+                }
+              }
+            },
+            "eventdata": {
+              "properties": {
+                "image":                { "type": "keyword" },
+                "parentImage":          { "type": "keyword" },
+                "commandLine": {
+                  "type": "text",
+                  "fields": { "keyword": { "type": "keyword", "ignore_above": 1024 } }
+                },
+                "parentCommandLine": {
+                  "type": "text",
+                  "fields": { "keyword": { "type": "keyword", "ignore_above": 1024 } }
+                },
+                "targetImage":          { "type": "keyword" },
+                "sourceImage":          { "type": "keyword" },
+                "targetObject":         { "type": "keyword" },
+                "destinationIp":        { "type": "ip"      },
+                "sourceIp":             { "type": "ip"      },
+                "destinationPort":      { "type": "integer" },
+                "sourcePort":           { "type": "integer" },
+                "protocol":             { "type": "keyword" },
+                "targetUserName":       { "type": "keyword" },
+                "subjectUserName":      { "type": "keyword" },
+                "targetDomainName":     { "type": "keyword" },
+                "logonType":            { "type": "keyword" },
+                "taskName":             { "type": "keyword" },
+                "newProcessName":       { "type": "keyword" },
+                "grantedAccess":        { "type": "keyword" },
+                "callTrace":            { "type": "keyword" },
+                "targetFilename":       { "type": "keyword" },
+                "authMethod":           { "type": "keyword" }
+              }
+            }
+          }
+        },
+
+        "syscheck": {
+          "properties": {
+            "path":          { "type": "keyword" },
+            "mode":          { "type": "keyword" },
+            "size_after":    { "type": "long"    },
+            "size_before":   { "type": "long"    },
+            "md5_after":     { "type": "keyword" },
+            "md5_before":    { "type": "keyword" },
+            "sha1_after":    { "type": "keyword" },
+            "sha1_before":   { "type": "keyword" },
+            "sha256_after":  { "type": "keyword" },
+            "sha256_before": { "type": "keyword" },
+            "uname_after":   { "type": "keyword" },
+            "uname_before":  { "type": "keyword" },
+            "gname_after":   { "type": "keyword" },
+            "perm_after":    { "type": "keyword" },
+            "perm_before":   { "type": "keyword" },
+            "attrs":         { "type": "keyword" },
+            "event":         { "type": "keyword" }
+          }
+        },
+
+        "location":  { "type": "keyword" },
+        "full_log": {
+          "type": "text",
+          "fields": { "keyword": { "type": "keyword", "ignore_above": 2048 } }
+        },
+        "decoder": {
+          "properties": {
+            "name":   { "type": "keyword" },
+            "parent": { "type": "keyword" }
+          }
+        },
+        "id":         { "type": "keyword" },
+        "cluster": {
+          "properties": {
+            "name": { "type": "keyword" },
+            "node": { "type": "keyword" }
+          }
+        },
+        "predecoder": {
+          "properties": {
+            "program_name": { "type": "keyword" },
+            "hostname":     { "type": "keyword" },
+            "timestamp":    { "type": "keyword" }
+          }
+        },
+
+        "GeoLocation": {
+          "properties": {
+            "city_name":    { "type": "keyword" },
+            "country_name": { "type": "keyword" },
+            "region_name":  { "type": "keyword" },
+            "location":     { "type": "geo_point" }
+          }
+        }
+
+      }
+    }
+  },
+  "composed_of": [],
+  "version": 1
+}

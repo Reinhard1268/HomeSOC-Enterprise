@@ -1,0 +1,380 @@
+{
+  "_meta": {
+    "description": "Shuffle SOAR workflow — automated brute force response",
+    "author": "SOC Lab Project",
+    "version": "1.0.0",
+    "trigger": "Wazuh webhook — rule 100001 or 100002",
+    "actions": [
+      "Parse Wazuh alert",
+      "Enrich source IP via AbuseIPDB",
+      "Create TheHive case",
+      "Block IP via firewall API",
+      "Send Slack/email notification"
+    ]
+  },
+  "id": "brute-force-auto-response",
+  "name": "Brute Force Auto Response",
+  "description": "Receives Wazuh webhook alert for SSH brute force (rules 100001/100002), enriches the source IP with AbuseIPDB threat intel, creates a TheHive case automatically, attempts host-level IP block via SSH, and sends a Slack notification to the SOC channel with full context.",
+  "tags": ["brute-force", "wazuh", "thehive", "auto-response", "ssh"],
+  "status": "production",
+  "triggers": [
+    {
+      "id": "trigger_wazuh_webhook",
+      "name": "Wazuh Alert Webhook",
+      "description": "Receives POST requests from Wazuh integration script. Configure Wazuh to POST to: http://<shuffle-host>:3001/api/v1/hooks/<hook_id>",
+      "type": "WEBHOOK",
+      "parameters": {
+        "auth_required": true,
+        "method": "POST",
+        "content_type": "application/json",
+        "sample_payload": {
+          "rule": {
+            "id": "100001",
+            "level": 12,
+            "description": "SSH brute force attack: 10+ failed logins from 192.168.1.50 in 60 seconds",
+            "groups": ["authentication_failures", "brute_force"],
+            "mitre": { "id": "T1110.001" }
+          },
+          "agent": {
+            "id": "001",
+            "name": "linux-endpoint-01",
+            "ip": "172.20.0.100"
+          },
+          "data": {
+            "srcip": "192.168.1.50",
+            "srcuser": "root",
+            "srcport": "54321"
+          },
+          "@timestamp": "2024-01-15T10:30:00.000Z",
+          "location": "/var/log/auth.log",
+          "full_log": "Jan 15 10:30:00 linux-endpoint-01 sshd[12345]: Failed password for root from 192.168.1.50 port 54321 ssh2"
+        }
+      }
+    }
+  ],
+  "actions": [
+
+    {
+      "id": "action_parse_alert",
+      "name": "Parse Wazuh Alert Fields",
+      "description": "Extracts and normalises key fields from the incoming Wazuh webhook JSON. Sets workflow variables used by all downstream actions.",
+      "app_name": "Shuffle Tools",
+      "app_version": "1.2.0",
+      "action": "execute_python",
+      "position": { "x": 200, "y": 100 },
+      "parameters": {
+        "code": "import json\nimport re\nfrom datetime import datetime\n\n# Parse incoming webhook body\ntry:\n    alert = json.loads('$exec')\nexcept Exception:\n    alert = $exec\n\n# Extract fields with safe defaults\nsrc_ip      = alert.get('data', {}).get('srcip', 'unknown')\nsrc_user    = alert.get('data', {}).get('srcuser', 'unknown')\nsrc_port    = alert.get('data', {}).get('srcport', 'unknown')\nrule_id     = alert.get('rule', {}).get('id', 'unknown')\nrule_level  = int(alert.get('rule', {}).get('level', 0))\nrule_desc   = alert.get('rule', {}).get('description', 'No description')\nagent_name  = alert.get('agent', {}).get('name', 'unknown')\nagent_ip    = alert.get('agent', {}).get('ip', 'unknown')\ntimestamp   = alert.get('@timestamp', datetime.utcnow().isoformat())\nfull_log    = alert.get('full_log', '')\nmitre_id    = alert.get('rule', {}).get('mitre', {}).get('id', 'T1110.001')\n\n# Determine if login succeeded (rule 100002 = critical)\nlogin_success = rule_id == '100002'\nseverity_label = 'CRITICAL' if login_success else ('HIGH' if rule_level >= 10 else 'MEDIUM')\nthehive_severity = 3 if login_success else (2 if rule_level >= 10 else 1)\n\n# Build output context\nresult = {\n    'src_ip': src_ip,\n    'src_user': src_user,\n    'src_port': src_port,\n    'rule_id': rule_id,\n    'rule_level': rule_level,\n    'rule_desc': rule_desc,\n    'agent_name': agent_name,\n    'agent_ip': agent_ip,\n    'timestamp': timestamp,\n    'full_log': full_log,\n    'mitre_id': mitre_id,\n    'login_success': login_success,\n    'severity_label': severity_label,\n    'thehive_severity': thehive_severity,\n    'case_title': f'[BF] SSH Brute Force from {src_ip} on {agent_name}'\n}\n\nprint(json.dumps(result))\n"
+      },
+      "returns": "parsed_alert"
+    },
+
+    {
+      "id": "action_ip_enrich",
+      "name": "Enrich IP via AbuseIPDB",
+      "description": "Queries AbuseIPDB API for the attacker IP's abuse confidence score, country, ISP, and usage type. Sets is_malicious=true if score > 25.",
+      "app_name": "HTTP",
+      "app_version": "1.3.0",
+      "action": "GET",
+      "position": { "x": 500, "y": 100 },
+      "depends_on": ["action_parse_alert"],
+      "parameters": {
+        "url": "https://api.abuseipdb.com/api/v2/check",
+        "headers": {
+          "Key": "$ENV_ABUSEIPDB_API_KEY",
+          "Accept": "application/json"
+        },
+        "queries": {
+          "ipAddress": "$action_parse_alert.src_ip",
+          "maxAgeInDays": "90",
+          "verbose": "true"
+        },
+        "timeout": 10,
+        "error_on_failure": false
+      },
+      "post_processing": {
+        "extract_fields": {
+          "abuse_score":     "$.data.abuseConfidenceScore",
+          "abuse_country":   "$.data.countryCode",
+          "abuse_isp":       "$.data.isp",
+          "abuse_reports":   "$.data.totalReports",
+          "abuse_usage":     "$.data.usageType",
+          "is_malicious":    "$.data.abuseConfidenceScore > 25"
+        }
+      },
+      "returns": "ip_enrichment"
+    },
+
+    {
+      "id": "action_create_thehive_case",
+      "name": "Create TheHive Case",
+      "description": "Creates a new case in TheHive 5 using the parsed alert data and IP enrichment results. Returns the case ID and number for use in subsequent actions.",
+      "app_name": "TheHive",
+      "app_version": "2.0.0",
+      "action": "create_case",
+      "position": { "x": 800, "y": 100 },
+      "depends_on": ["action_parse_alert", "action_ip_enrich"],
+      "parameters": {
+        "url": "$ENV_THEHIVE_URL",
+        "apikey": "$ENV_THEHIVE_API_KEY",
+        "title": "$action_parse_alert.case_title",
+        "description": "## Automated Case — SSH Brute Force\n\n**Wazuh Rule:** $action_parse_alert.rule_id — $action_parse_alert.rule_desc\n\n**Attacker IP:** `$action_parse_alert.src_ip`\n**Target Account:** `$action_parse_alert.src_user`\n**Attacked Host:** `$action_parse_alert.agent_name` ($action_parse_alert.agent_ip)\n**Attack Timestamp:** $action_parse_alert.timestamp\n**Login Succeeded:** $action_parse_alert.login_success\n\n---\n\n### IP Intelligence (AbuseIPDB)\n- **Abuse Score:** $ip_enrichment.abuse_score / 100\n- **Country:** $ip_enrichment.abuse_country\n- **ISP:** $ip_enrichment.abuse_isp\n- **Total Reports:** $ip_enrichment.abuse_reports\n- **Usage Type:** $ip_enrichment.abuse_usage\n\n---\n\n### MITRE ATT&CK\n- **Technique:** $action_parse_alert.mitre_id (Brute Force: Password Guessing)\n\n---\n\n### Raw Log\n```\n$action_parse_alert.full_log\n```\n\n---\n*Case auto-created by Shuffle SOAR at $action_parse_alert.timestamp*",
+        "severity": "$action_parse_alert.thehive_severity",
+        "tlp": 2,
+        "pap": 2,
+        "tags": [
+          "brute-force",
+          "ssh",
+          "automated",
+          "wazuh",
+          "$action_parse_alert.mitre_id"
+        ],
+        "status": "New",
+        "assignee": "admin@thehive.local",
+        "customFields": {
+          "attackerIP":         "$action_parse_alert.src_ip",
+          "targetedAccount":    "$action_parse_alert.src_user",
+          "targetedHost":       "$action_parse_alert.agent_name",
+          "loginSucceeded":     "$action_parse_alert.login_success",
+          "wazuhRuleID":        "$action_parse_alert.rule_id",
+          "ipReputation":       "AbuseIPDB score: $ip_enrichment.abuse_score/100 ($ip_enrichment.abuse_country)",
+          "failedAttemptCount": 10
+        }
+      },
+      "returns": "thehive_case"
+    },
+
+    {
+      "id": "action_create_observable",
+      "name": "Add IP Observable to Case",
+      "description": "Adds the attacker IP as an observable (IOC) to the newly created TheHive case for threat tracking and future correlation.",
+      "app_name": "TheHive",
+      "app_version": "2.0.0",
+      "action": "create_observable",
+      "position": { "x": 800, "y": 250 },
+      "depends_on": ["action_create_thehive_case"],
+      "parameters": {
+        "url": "$ENV_THEHIVE_URL",
+        "apikey": "$ENV_THEHIVE_API_KEY",
+        "case_id": "$thehive_case.id",
+        "data": "$action_parse_alert.src_ip",
+        "datatype": "ip",
+        "message": "Attacker source IP — SSH brute force origin",
+        "tags": ["attacker-ip", "brute-force", "ioc"],
+        "tlp": 2,
+        "ioc": true,
+        "sighted": true
+      },
+      "returns": "observable_result"
+    },
+
+    {
+      "id": "action_block_ip",
+      "name": "Block Attacker IP on Target Host",
+      "description": "SSHes into the attacked host using a dedicated SOC service account and adds a UFW/iptables deny rule for the attacker IP. Only executes if src_ip is a valid public IP (skips RFC1918 ranges to avoid blocking internal hosts).",
+      "app_name": "SSH",
+      "app_version": "1.1.0",
+      "action": "execute_command",
+      "position": { "x": 1100, "y": 100 },
+      "depends_on": ["action_create_thehive_case"],
+      "condition": {
+        "description": "Only block if IP is NOT in RFC1918 private ranges",
+        "expression": "not ($action_parse_alert.src_ip starts_with '10.' or $action_parse_alert.src_ip starts_with '192.168.' or $action_parse_alert.src_ip starts_with '172.')"
+      },
+      "parameters": {
+        "hostname": "$action_parse_alert.agent_ip",
+        "port": 22,
+        "username": "$ENV_SOC_SSH_USER",
+        "ssh_key": "$ENV_SOC_SSH_KEY",
+        "timeout": 30,
+        "command": "sudo ufw insert 1 deny from $action_parse_alert.src_ip to any comment 'Shuffle-AutoBlock-CaseID-$thehive_case.number' 2>/dev/null || sudo iptables -I INPUT 1 -s $action_parse_alert.src_ip -j DROP -m comment --comment 'Shuffle-AutoBlock-$thehive_case.number'; echo 'BLOCKED: $action_parse_alert.src_ip at $(date)'"
+      },
+      "error_handling": {
+        "on_failure": "continue",
+        "log_error": true,
+        "notify": "Block failed — manual action required"
+      },
+      "returns": "block_result"
+    },
+
+    {
+      "id": "action_update_case_block",
+      "name": "Update Case with Block Status",
+      "description": "Adds a note to the TheHive case documenting whether the automatic IP block succeeded or failed, including the command output.",
+      "app_name": "TheHive",
+      "app_version": "2.0.0",
+      "action": "create_task_log",
+      "position": { "x": 1100, "y": 250 },
+      "depends_on": ["action_block_ip"],
+      "parameters": {
+        "url": "$ENV_THEHIVE_URL",
+        "apikey": "$ENV_THEHIVE_API_KEY",
+        "case_id": "$thehive_case.id",
+        "message": "## Automated IP Block Result\n\n**Action:** UFW/iptables deny rule for `$action_parse_alert.src_ip`\n**Target Host:** $action_parse_alert.agent_name\n**Result:** $block_result\n**Executed at:** $(date -u)\n\n*Note: If block failed, manual action required — see containment steps in playbook.*"
+      },
+      "returns": "case_note_result"
+    },
+
+    {
+      "id": "action_slack_notify",
+      "name": "Send Slack Notification to SOC Channel",
+      "description": "Posts a formatted Slack message to the #soc-alerts channel with full incident context, severity colour coding, and direct link to the TheHive case.",
+      "app_name": "Slack",
+      "app_version": "1.4.0",
+      "action": "post_message",
+      "position": { "x": 1400, "y": 100 },
+      "depends_on": ["action_create_thehive_case", "action_block_ip"],
+      "parameters": {
+        "apikey": "$ENV_SLACK_BOT_TOKEN",
+        "channel": "$ENV_SLACK_SOC_CHANNEL",
+        "username": "SOC-SOAR-Bot",
+        "icon_emoji": ":shield:",
+        "blocks": [
+          {
+            "type": "header",
+            "text": {
+              "type": "plain_text",
+              "text": ":rotating_light: $action_parse_alert.severity_label — SSH Brute Force Detected"
+            }
+          },
+          {
+            "type": "section",
+            "fields": [
+              { "type": "mrkdwn", "text": "*Attacker IP:*\n`$action_parse_alert.src_ip`" },
+              { "type": "mrkdwn", "text": "*Target Host:*\n`$action_parse_alert.agent_name`" },
+              { "type": "mrkdwn", "text": "*Target Account:*\n`$action_parse_alert.src_user`" },
+              { "type": "mrkdwn", "text": "*Login Succeeded:*\n`$action_parse_alert.login_success`" },
+              { "type": "mrkdwn", "text": "*Wazuh Rule:*\n`$action_parse_alert.rule_id`" },
+              { "type": "mrkdwn", "text": "*MITRE ATT&CK:*\n`$action_parse_alert.mitre_id`" }
+            ]
+          },
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "*IP Intelligence (AbuseIPDB):*\nScore: `$ip_enrichment.abuse_score/100` | Country: `$ip_enrichment.abuse_country` | ISP: `$ip_enrichment.abuse_isp`"
+            }
+          },
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "*Auto-Block Status:* $block_result\n*TheHive Case:* <$ENV_THEHIVE_URL/cases/$thehive_case.id|Case #$thehive_case.number>"
+            }
+          },
+          {
+            "type": "actions",
+            "elements": [
+              {
+                "type": "button",
+                "text": { "type": "plain_text", "text": "View TheHive Case" },
+                "url": "$ENV_THEHIVE_URL/cases/$thehive_case.id",
+                "style": "danger"
+              },
+              {
+                "type": "button",
+                "text": { "type": "plain_text", "text": "View in Kibana" },
+                "url": "http://$ENV_KIBANA_HOST:5601/app/discover#/?_g=(time:(from:now-1h,to:now))&_a=(query:(language:kuery,query:'data.srcip:\"$action_parse_alert.src_ip\"'))"
+              }
+            ]
+          }
+        ]
+      },
+      "returns": "slack_result"
+    },
+
+    {
+      "id": "action_email_notify",
+      "name": "Send Email Notification (Critical Only)",
+      "description": "Sends an email alert for CRITICAL severity cases only (rule 100002 — successful login after brute force). Emails the SOC distribution list with full incident summary.",
+      "app_name": "SMTP",
+      "app_version": "1.1.0",
+      "action": "send_email",
+      "position": { "x": 1400, "y": 250 },
+      "depends_on": ["action_create_thehive_case"],
+      "condition": {
+        "description": "Only send email for Critical severity (login succeeded)",
+        "expression": "$action_parse_alert.login_success == true"
+      },
+      "parameters": {
+        "smtp_host": "$ENV_SMTP_HOST",
+        "smtp_port": 587,
+        "smtp_user": "$ENV_SMTP_USER",
+        "smtp_password": "$ENV_SMTP_PASSWORD",
+        "use_tls": true,
+        "from": "soc-alerts@$ENV_SOC_DOMAIN",
+        "to": "$ENV_SOC_EMAIL_LIST",
+        "subject": "[CRITICAL] SSH Brute Force SUCCESS — $action_parse_alert.agent_name compromised — Case #$thehive_case.number",
+        "body_html": "<html><body style='font-family:Arial,sans-serif;'><div style='background:#d32f2f;color:white;padding:20px;border-radius:8px;'><h1>&#128680; CRITICAL INCIDENT ALERT</h1><h2>SSH Brute Force — Successful Login Detected</h2></div><div style='padding:20px;border:1px solid #ddd;margin-top:10px;border-radius:8px;'><table style='width:100%;border-collapse:collapse;'><tr><td style='padding:8px;font-weight:bold;width:200px;'>Attacker IP</td><td style='padding:8px;font-family:monospace;background:#f5f5f5;'>$action_parse_alert.src_ip</td></tr><tr><td style='padding:8px;font-weight:bold;'>Targeted Host</td><td style='padding:8px;font-family:monospace;background:#f5f5f5;'>$action_parse_alert.agent_name ($action_parse_alert.agent_ip)</td></tr><tr><td style='padding:8px;font-weight:bold;'>Compromised Account</td><td style='padding:8px;font-family:monospace;background:#f5f5f5;'>$action_parse_alert.src_user</td></tr><tr><td style='padding:8px;font-weight:bold;'>Timestamp</td><td style='padding:8px;'>$action_parse_alert.timestamp</td></tr><tr><td style='padding:8px;font-weight:bold;'>IP Abuse Score</td><td style='padding:8px;'>$ip_enrichment.abuse_score / 100 ($ip_enrichment.abuse_country)</td></tr><tr><td style='padding:8px;font-weight:bold;'>MITRE ATT&CK</td><td style='padding:8px;'>$action_parse_alert.mitre_id</td></tr><tr><td style='padding:8px;font-weight:bold;'>TheHive Case</td><td style='padding:8px;'><a href='$ENV_THEHIVE_URL/cases/$thehive_case.id'>Case #$thehive_case.number</a></td></tr></table><br/><p style='color:#d32f2f;font-weight:bold;'>IMMEDIATE ACTION REQUIRED: Account $action_parse_alert.src_user on $action_parse_alert.agent_name may be compromised. Refer to brute-force-playbook.md Phase 2 for containment steps.</p></div></body></html>"
+      },
+      "returns": "email_result"
+    }
+
+  ],
+  "environment_variables": {
+    "ENV_THEHIVE_URL": {
+      "description": "TheHive base URL",
+      "example": "http://172.20.0.31:9000",
+      "required": true
+    },
+    "ENV_THEHIVE_API_KEY": {
+      "description": "TheHive API key — generate in TheHive > Settings > API Keys",
+      "required": true,
+      "secret": true
+    },
+    "ENV_ABUSEIPDB_API_KEY": {
+      "description": "AbuseIPDB API key — register free at abuseipdb.com",
+      "required": true,
+      "secret": true
+    },
+    "ENV_SLACK_BOT_TOKEN": {
+      "description": "Slack Bot OAuth token (xoxb-...)",
+      "required": false,
+      "secret": true
+    },
+    "ENV_SLACK_SOC_CHANNEL": {
+      "description": "Slack channel ID for SOC alerts",
+      "example": "#soc-alerts",
+      "required": false
+    },
+    "ENV_SMTP_HOST": {
+      "description": "SMTP relay hostname",
+      "example": "smtp.gmail.com",
+      "required": false
+    },
+    "ENV_SMTP_USER": {
+      "description": "SMTP authentication username",
+      "required": false,
+      "secret": true
+    },
+    "ENV_SMTP_PASSWORD": {
+      "description": "SMTP authentication password",
+      "required": false,
+      "secret": true
+    },
+    "ENV_SOC_SSH_USER": {
+      "description": "Service account username for SSH-based auto-blocking",
+      "example": "soc-automation",
+      "required": false
+    },
+    "ENV_SOC_SSH_KEY": {
+      "description": "Private SSH key for soc-automation service account (base64 encoded)",
+      "required": false,
+      "secret": true
+    },
+    "ENV_SOC_DOMAIN": {
+      "description": "Your SOC lab domain for email from-address",
+      "example": "soc-lab.local",
+      "required": false
+    },
+    "ENV_SOC_EMAIL_LIST": {
+      "description": "Comma-separated list of SOC analyst email addresses",
+      "example": "analyst@example.com,manager@example.com",
+      "required": false
+    },
+    "ENV_KIBANA_HOST": {
+      "description": "Kibana hostname or IP for dashboard deep-links in Slack",
+      "example": "172.20.0.21",
+      "required": false
+    }
+  }
+}
